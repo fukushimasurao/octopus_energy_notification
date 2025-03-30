@@ -11,7 +11,7 @@ class FetchOctopusUsage extends Command
 {
     protected $signature = 'app:fetch-octopus-usage {--date=} {--from=} {--to=}';
 
-    protected $description = 'Fetch daily electricity usage from Octopus and store in the database';
+    protected $description = 'Fetch daily electricity usage from Octopus, store it, and notify via LINE';
 
     public function handle(): int
     {
@@ -27,27 +27,27 @@ class FetchOctopusUsage extends Command
             $token = $this->getToken();
             if (!$token) {
                 $this->error("❌ トークン取得失敗（範囲指定）");
-                $result = 1;
-            } else {
-                while ($from->lte($to)) {
-                    $date = $from->format('Y-m-d');
-                    $this->processSingleDay($date, $token);
-                    sleep(3);
-                    $from->addDay();
-                }
+                return 1;
             }
 
-        } else {
-            $token = $this->getToken();
-            if (!$token) {
-                $this->error('❌ トークン取得失敗。');
-                $result = 1;
-            } else {
-                $result = $this->processSingleDay($this->option('date'), $token);
+            while ($from->lte($to)) {
+                $date = $from->format('Y-m-d');
+                $this->processSingleDay($date, $token);
+                sleep(3);
+                $from->addDay();
             }
+
+            return $result;
         }
 
-        return $result;
+        // 単日処理
+        $token = $this->getToken();
+        if (!$token) {
+            $this->error('❌ トークン取得失敗。');
+            return 1;
+        }
+
+        return $this->processSingleDay($this->option('date'), $token);
     }
 
     private function processSingleDay(?string $inputDate, string $token): int
@@ -73,15 +73,20 @@ class FetchOctopusUsage extends Command
         $totalKWh = $this->calculateTotalKWh($filteredReadings->all());
         $estimatedCost = $this->calculateEstimatedCost($totalKWh);
 
-        $this->line("✅ {$dateText} の合計電力使用量: {$totalKWh} kWh");
-        $this->line("💰 推定電気料金: {$estimatedCost} 円");
+        // 単日出力
+        $dailyText = "✅ {$dateText} の合計電力使用量: {$totalKWh} kWh\n💰 推定電気料金: {$estimatedCost} 円";
 
         OctopusUsage::updateOrCreate(
             ['date' => $dateText],
             ['kwh' => $totalKWh, 'estimated_cost' => $estimatedCost]
         );
 
-        $this->outputMonthlySummary($targetDateJST);
+        // 月次集計とLINE通知
+        [$summaryText, $totalKWhMonth, $totalCostMonth] = $this->getMonthlySummaryText($targetDateJST);
+
+        $message = "{$dailyText}\n{$summaryText}";
+        $this->line($message);
+        $this->notifyLine($message);
 
         return 0;
     }
@@ -172,7 +177,7 @@ class FetchOctopusUsage extends Command
         return round($baseCost + $energyCost, 2);
     }
 
-    private function outputMonthlySummary(Carbon $targetDate): void
+    private function getMonthlySummaryText(Carbon $targetDate): array
     {
         $year = $targetDate->year;
         $month = $targetDate->month;
@@ -186,12 +191,33 @@ class FetchOctopusUsage extends Command
         }
 
         $usages = OctopusUsage::whereBetween('date', [$start->toDateString(), $end->toDateString()])->get();
-
         $totalKWh = $usages->sum('kwh');
         $totalCost = $usages->sum('estimated_cost');
 
-        $this->line("📊 月次集計（{$start->format('Y/m/d')}〜{$end->format('Y/m/d')}）");
-        $this->line("🔌 合計使用量: {$totalKWh} kWh");
-        $this->line("💰 合計金額: {$totalCost} 円");
+        $text = "📊 月次集計（{$start->format('Y/m/d')}〜{$end->format('Y/m/d')}）\n"
+            . "🔌 合計使用量: {$totalKWh} kWh\n"
+            . "💰 合計金額: {$totalCost} 円";
+
+        return [$text, $totalKWh, $totalCost];
+    }
+
+    private function notifyLine(string $message): void
+    {
+        $accessToken = env('LINE_CHANNEL_ACCESS_TOKEN');
+        $userId = env('LINE_USER_ID');
+
+        if (!$accessToken || !$userId) {
+            return;
+        }
+
+        Http::withToken($accessToken)->post('https://api.line.me/v2/bot/message/push', [
+            'to' => $userId,
+            'messages' => [
+                [
+                    'type' => 'text',
+                    'text' => $message,
+                ]
+            ],
+        ]);
     }
 }
