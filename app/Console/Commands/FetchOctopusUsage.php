@@ -5,6 +5,7 @@ namespace App\Console\Commands;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Http;
 use Carbon\Carbon;
+use App\Models\OctopusUsage;
 
 class FetchOctopusUsage extends Command
 {
@@ -48,6 +49,13 @@ class FetchOctopusUsage extends Command
 
         $this->info("✅ {$dateText} の合計電力使用量: {$totalKWh} kWh");
         $this->info("💰 推定電気料金: {$estimatedCost} 円");
+
+        OctopusUsage::updateOrCreate(
+            ['date' => $dateText],
+            ['kwh' => $totalKWh, 'estimated_cost' => $estimatedCost]
+        );
+
+        $this->info("📝 データベースに保存しました。");
 
         return 0;
     }
