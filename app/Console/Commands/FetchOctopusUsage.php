@@ -52,6 +52,11 @@ class FetchOctopusUsage extends Command
         return 0;
     }
 
+    /**
+     * 対象となるJST日付と、それに対応するUTCの開始・終了時刻を取得する。
+     *
+     * @return array [Carbon $targetDateJST, string $startUtc, string $endUtc]
+     */
     private function getTargetDateRange(): array
     {
         $inputDate = $this->option('date');
@@ -65,6 +70,11 @@ class FetchOctopusUsage extends Command
         return [$targetDateJST, $startUtc, $endUtc];
     }
 
+    /**
+     * Octopus Energy APIからJWTトークンを取得する。
+     *
+     * @return string|null 成功時はトークン、失敗時はnull
+     */
     private function getToken(): ?string
     {
         $email = env('OCTOPUS_EMAIL');
@@ -82,6 +92,12 @@ class FetchOctopusUsage extends Command
         return $response['data']['obtainKrakenToken']['token'] ?? null;
     }
 
+    /**
+     * トークンに紐づくOctopus Energyのアカウント番号を取得する。
+     *
+     * @param string $token JWTトークン
+     * @return string|null アカウント番号またはnull
+     */
     private function getAccountNumber(string $token): ?string
     {
         $res = Http::withHeaders([
@@ -93,6 +109,15 @@ class FetchOctopusUsage extends Command
         return $res['data']['viewer']['accounts'][0]['number'] ?? null;
     }
 
+    /**
+     * 指定された期間の30分ごとの電力使用量データを取得する。
+     *
+     * @param string $token JWTトークン
+     * @param string $accountNumber アカウント番号
+     * @param string $startUtc UTCの開始日時
+     * @param string $endUtc UTCの終了日時
+     * @return array 使用量データの配列
+     */
     private function getHalfHourlyReadings(string $token, string $accountNumber, string $startUtc, string $endUtc): array
     {
         $query = [
@@ -118,11 +143,24 @@ class FetchOctopusUsage extends Command
         return $res['data']['account']['properties'][0]['electricitySupplyPoints'][0]['halfHourlyReadings'] ?? [];
     }
 
+    /**
+     * 電力使用量（kWh）を30分ごとのデータから合計する。
+     *
+     * @param array $readings 使用量データ
+     * @return float 合計kWh
+     */
     private function calculateTotalKWh(array $readings): float
     {
         return collect($readings)->reduce(fn($carry, $item) => $carry + floatval($item['value']), 0);
     }
 
+    /**
+     * 指定されたkWh使用量に基づき、電気料金を推定する。
+     * 段階料金制に基づいて料金を計算し、基本料金を加算する。
+     *
+     * @param float $totalKWh 使用量（kWh）
+     * @return float 推定料金（円）
+     */
     private function calculateEstimatedCost(float $totalKWh): float
     {
         $baseCost = 29.10;
