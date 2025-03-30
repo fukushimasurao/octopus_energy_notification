@@ -38,14 +38,16 @@ class FetchOctopusUsage extends Command
             return 0;
         }
 
-        // JSTの対象日だけに絞り込む（UTC→JST変換して日付フィルタ）
         $filteredReadings = collect($readings)->filter(function ($item) use ($targetDateJST) {
-            $startAt = Carbon::parse($item['startAt'])->addHours(9); // JST変換
+            $startAt = Carbon::parse($item['startAt'])->addHours(9);
             return $startAt->isSameDay($targetDateJST);
         });
 
         $totalKWh = $this->calculateTotalKWh($filteredReadings->all());
+        $estimatedCost = $this->calculateEstimatedCost($totalKWh);
+
         $this->info("✅ {$dateText} の合計電力使用量: {$totalKWh} kWh");
+        $this->info("💰 推定電気料金: {$estimatedCost} 円 (税込)");
 
         return 0;
     }
@@ -113,12 +115,27 @@ class FetchOctopusUsage extends Command
             'Authorization' => 'JWT ' . $token,
         ])->post('https://api.oejp-kraken.energy/v1/graphql/', $query);
 
-        // supplyPoints[0] のみ利用（1つのメーター対象）
         return $res['data']['account']['properties'][0]['electricitySupplyPoints'][0]['halfHourlyReadings'] ?? [];
     }
 
     private function calculateTotalKWh(array $readings): float
     {
         return collect($readings)->reduce(fn($carry, $item) => $carry + floatval($item['value']), 0);
+    }
+
+    private function calculateEstimatedCost(float $totalKWh): float
+    {
+        $baseCost = 29.10;
+        $energyCost = 0.0;
+
+        if ($totalKWh <= 120) {
+            $energyCost = $totalKWh * 20.62;
+        } elseif ($totalKWh <= 300) {
+            $energyCost = 120 * 20.62 + ($totalKWh - 120) * 25.29;
+        } else {
+            $energyCost = 120 * 20.62 + 180 * 25.29 + ($totalKWh - 300) * 27.44;
+        }
+
+        return round($baseCost + $energyCost, 2);
     }
 }
