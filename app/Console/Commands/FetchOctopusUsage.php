@@ -8,89 +8,92 @@ use Carbon\Carbon;
 
 class FetchOctopusUsage extends Command
 {
-    /**
-     * The name and signature of the console command.
-     *
-     * @var string
-     */
-    protected $signature = 'app:fetch-octopus-usage';
+    protected $signature = 'app:fetch-octopus-usage {--date=}';
 
-    /**
-     * The console command description.
-     *
-     * @var string
-     */
-    protected $description = 'Fetch yesterday\'s electricity usage from Octopus and notify via LINE';
+    protected $description = 'Fetch daily electricity usage from Octopus and notify via LINE';
 
-
-    /**
-     * Execute the console command.
-     */
-    public function handle()
+    public function handle(): int
     {
-        $email = env('OCTOPUS_EMAIL');
-        $password = env('OCTOPUS_PASSWORD');
-        $lineUserId = env('LINE_USER_ID');
-        $lineAccessToken = env('LINE_CHANNEL_ACCESS_TOKEN');
-
-
-        // Octopus APIエンドポイント
-        $apiUrl = 'https://api.oejp-kraken.energy/v1/graphql/';
-
-        // 前日（JST）→ UTC に変換
-        $targetDateJST = Carbon::yesterday()->startOfDay();
-        $startUtc = $targetDateJST->copy()->subHours(9);
-        $endUtc = $targetDateJST->copy()->addDay()->subSeconds(1)->subHours(9);
-
-        // 表示確認
-        $this->info("🕒 UTC取得範囲: {$startUtc} ～ {$endUtc}");
-        $this->info("🗓 対象JST日付: {$targetDateJST->format('Y-m-d')} (00:00 ～ 23:59)");
-
-
+        [$targetDateJST, $startUtc, $endUtc] = $this->getTargetDateRange();
         $dateText = $targetDateJST->format('Y-m-d');
 
-        $this->info("⏱ 前日: $dateText のデータを取得中...");
+        $this->info("\n🕒 UTC取得範囲: {$startUtc} ～ {$endUtc}");
+        $this->info("🗓 対象JST日付: {$dateText} (00:00 ～ 23:59)");
 
-        // Step1: トークン取得
-        $authPayload = [
-            'query' => 'mutation obtainKrakenToken($input: ObtainJSONWebTokenInput!) {
-                obtainKrakenToken(input: $input) {
-                    token
-                }
-            }',
-            'variables' => ['input' => ['email' => $email, 'password' => $password]],
-        ];
-
-        $authRes = Http::post($apiUrl, $authPayload);
-        $token = $authRes['data']['obtainKrakenToken']['token'] ?? null;
-
+        $token = $this->getToken();
         if (!$token) {
-            $this->error('❌ トークン取得失敗。メールとパスワードを確認してください。');
+            $this->error('❌ トークン取得失敗。');
             return 1;
         }
 
-        // Step 2: アカウント番号取得
-        $accountRes = Http::withHeaders([
-            'Authorization' => 'JWT ' . $token,
-        ])->post($apiUrl, [
-            'query' => 'query accountViewer {
-                viewer {
-                    accounts {
-                        number
-                    }
-                }
-            }'
-        ]);
-
-        $accountNumber = $accountRes['data']['viewer']['accounts'][0]['number'] ?? null;
-
+        $accountNumber = $this->getAccountNumber($token);
         if (!$accountNumber) {
             $this->error('❌ アカウント番号取得失敗。');
             return 1;
         }
 
-        // Step3: 使用量取得
-        $usageQuery = [
+        $readings = $this->getHalfHourlyReadings($token, $accountNumber, $startUtc, $endUtc);
+        if (empty($readings)) {
+            $this->warn("⚠️ データが見つかりませんでした。");
+            return 0;
+        }
+
+        // JSTの対象日だけに絞り込む（UTC→JST変換して日付フィルタ）
+        $filteredReadings = collect($readings)->filter(function ($item) use ($targetDateJST) {
+            $startAt = Carbon::parse($item['startAt'])->addHours(9); // JST変換
+            return $startAt->isSameDay($targetDateJST);
+        });
+
+        $totalKWh = $this->calculateTotalKWh($filteredReadings->all());
+        $this->info("✅ {$dateText} の合計電力使用量: {$totalKWh} kWh");
+
+        return 0;
+    }
+
+    private function getTargetDateRange(): array
+    {
+        $inputDate = $this->option('date');
+        $targetDateJST = $inputDate
+            ? Carbon::createFromFormat('Y-m-d', $inputDate)->startOfDay()
+            : Carbon::yesterday()->startOfDay();
+
+        $startUtc = $targetDateJST->copy()->subHours(9)->toIso8601String();
+        $endUtc = $targetDateJST->copy()->addDay()->subSecond()->subHours(9)->toIso8601String();
+
+        return [$targetDateJST, $startUtc, $endUtc];
+    }
+
+    private function getToken(): ?string
+    {
+        $email = env('OCTOPUS_EMAIL');
+        $password = env('OCTOPUS_PASSWORD');
+
+        $response = Http::post('https://api.oejp-kraken.energy/v1/graphql/', [
+            'query' => 'mutation obtainKrakenToken($input: ObtainJSONWebTokenInput!) {
+                obtainKrakenToken(input: $input) {
+                    token
+                }
+            }',
+            'variables' => ['input' => compact('email', 'password')],
+        ]);
+
+        return $response['data']['obtainKrakenToken']['token'] ?? null;
+    }
+
+    private function getAccountNumber(string $token): ?string
+    {
+        $res = Http::withHeaders([
+            'Authorization' => 'JWT ' . $token,
+        ])->post('https://api.oejp-kraken.energy/v1/graphql/', [
+            'query' => 'query accountViewer { viewer { accounts { number } } }'
+        ]);
+
+        return $res['data']['viewer']['accounts'][0]['number'] ?? null;
+    }
+
+    private function getHalfHourlyReadings(string $token, string $accountNumber, string $startUtc, string $endUtc): array
+    {
+        $query = [
             'query' => 'query halfHourlyReadings($accountNumber: String!, $fromDatetime: DateTime, $toDatetime: DateTime) {
                 account(accountNumber: $accountNumber) {
                     properties {
@@ -103,30 +106,19 @@ class FetchOctopusUsage extends Command
                     }
                 }
             }',
-            'variables' => [
-                'accountNumber' => $accountNumber,
-                'fromDatetime' => $startUtc,
-                'toDatetime' => $endUtc,
-            ]
+            'variables' => compact('accountNumber', 'startUtc', 'endUtc')
         ];
 
-        $usageRes = Http::withHeaders([
+        $res = Http::withHeaders([
             'Authorization' => 'JWT ' . $token,
-        ])->post($apiUrl, $usageQuery);
-        $readings = $usageRes['data']['account']['properties'][0]['electricitySupplyPoints'][0]['halfHourlyReadings'] ?? [];
+        ])->post('https://api.oejp-kraken.energy/v1/graphql/', $query);
 
-        if (empty($readings)) {
-            $this->warn("⚠️ データが見つかりませんでした。");
-            return 0;
-        }
+        // supplyPoints[0] のみ利用（1つのメーター対象）
+        return $res['data']['account']['properties'][0]['electricitySupplyPoints'][0]['halfHourlyReadings'] ?? [];
+    }
 
-        // Step4: 合計
-        $totalKWh = collect($readings)->reduce(function ($carry, $item) {
-            return $carry + floatval($item['value']);
-        }, 0);
-
-        $this->info("✅ {$dateText} の合計電力使用量: {$totalKWh} kWh");
-
-        return 0;
+    private function calculateTotalKWh(array $readings): float
+    {
+        return collect($readings)->reduce(fn($carry, $item) => $carry + floatval($item['value']), 0);
     }
 }
