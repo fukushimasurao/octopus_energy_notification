@@ -15,58 +15,53 @@ class FetchOctopusUsage extends Command
 
     public function handle(): int
     {
-        // 🔁 複数日対応
-        if ($this->option('from') && $this->option('to')) {
-            $from = Carbon::createFromFormat('Y-m-d', $this->option('from'));
-            $to = Carbon::createFromFormat('Y-m-d', $this->option('to'));
+        $result = 0;
+
+        $fromInput = $this->option('from');
+        $toInput = $this->option('to');
+
+        if ($fromInput !== null && $toInput !== null) {
+            $from = Carbon::createFromFormat('Y-m-d', $fromInput);
+            $to = Carbon::createFromFormat('Y-m-d', $toInput);
 
             $token = $this->getToken();
             if (!$token) {
                 $this->error("❌ トークン取得失敗（範囲指定）");
-                return 1;
+                $result = 1;
+            } else {
+                while ($from->lte($to)) {
+                    $date = $from->format('Y-m-d');
+                    $this->processSingleDay($date, $token);
+                    sleep(3);
+                    $from->addDay();
+                }
             }
 
-            while ($from->lte($to)) {
-                $date = $from->format('Y-m-d');
-                $this->info("📅 処理中: {$date}");
-                $this->processSingleDay($date, $token);
-                sleep(3); // API制限対策の待機
-                $from->addDay();
+        } else {
+            $token = $this->getToken();
+            if (!$token) {
+                $this->error('❌ トークン取得失敗。');
+                $result = 1;
+            } else {
+                $result = $this->processSingleDay($this->option('date'), $token);
             }
-
-            return 0;
         }
 
-        // 🔁 単一日の処理
-        $token = $this->getToken();
-        if (!$token) {
-            $this->error('❌ トークン取得失敗。');
-            return 1;
-        }
-
-        return $this->processSingleDay($this->option('date'), $token);
+        return $result;
     }
 
-    /**
-     * 指定日のデータを取得・保存
-     */
     private function processSingleDay(?string $inputDate, string $token): int
     {
         [$targetDateJST, $startUtc, $endUtc] = $this->getTargetDateRange($inputDate);
         $dateText = $targetDateJST->format('Y-m-d');
 
-        $this->info("\n🕒 UTC取得範囲: {$startUtc} ～ {$endUtc}");
-        $this->info("🗓 対象JST日付: {$dateText} (00:00 ～ 23:59)");
-
         $accountNumber = $this->getAccountNumber($token);
         if (!$accountNumber) {
-            $this->error("❌ アカウント番号取得失敗（{$dateText}）");
             return 1;
         }
 
         $readings = $this->getHalfHourlyReadings($token, $accountNumber, $startUtc, $endUtc);
         if (empty($readings)) {
-            $this->warn("⚠️ データが見つかりませんでした（{$dateText}）");
             return 0;
         }
 
@@ -78,22 +73,19 @@ class FetchOctopusUsage extends Command
         $totalKWh = $this->calculateTotalKWh($filteredReadings->all());
         $estimatedCost = $this->calculateEstimatedCost($totalKWh);
 
-        $this->info("✅ {$dateText} の合計電力使用量: {$totalKWh} kWh");
-        $this->info("💰 推定電気料金: {$estimatedCost} 円");
+        $this->line("✅ {$dateText} の合計電力使用量: {$totalKWh} kWh");
+        $this->line("💰 推定電気料金: {$estimatedCost} 円");
 
         OctopusUsage::updateOrCreate(
             ['date' => $dateText],
             ['kwh' => $totalKWh, 'estimated_cost' => $estimatedCost]
         );
 
-        $this->info("📝 データベースに保存しました。");
+        $this->outputMonthlySummary($targetDateJST);
 
         return 0;
     }
 
-    /**
-     * JST日付からUTCの範囲を取得
-     */
     private function getTargetDateRange(?string $inputDate = null): array
     {
         $targetDateJST = $inputDate
@@ -106,9 +98,6 @@ class FetchOctopusUsage extends Command
         return [$targetDateJST, $startUtc, $endUtc];
     }
 
-    /**
-     * OctopusのJWTトークンを取得
-     */
     private function getToken(): ?string
     {
         $email = env('OCTOPUS_EMAIL');
@@ -126,9 +115,6 @@ class FetchOctopusUsage extends Command
         return $response['data']['obtainKrakenToken']['token'] ?? null;
     }
 
-    /**
-     * アカウント番号を取得
-     */
     private function getAccountNumber(string $token): ?string
     {
         $res = Http::withHeaders([
@@ -140,9 +126,6 @@ class FetchOctopusUsage extends Command
         return $res['data']['viewer']['accounts'][0]['number'] ?? null;
     }
 
-    /**
-     * 指定期間の電力使用量データを取得
-     */
     private function getHalfHourlyReadings(string $token, string $accountNumber, string $startUtc, string $endUtc): array
     {
         $query = [
@@ -168,17 +151,11 @@ class FetchOctopusUsage extends Command
         return $res['data']['account']['properties'][0]['electricitySupplyPoints'][0]['halfHourlyReadings'] ?? [];
     }
 
-    /**
-     * 合計使用量（kWh）を算出
-     */
     private function calculateTotalKWh(array $readings): float
     {
         return collect($readings)->reduce(fn($carry, $item) => $carry + floatval($item['value']), 0);
     }
 
-    /**
-     * 使用量から段階料金制で金額を算出
-     */
     private function calculateEstimatedCost(float $totalKWh): float
     {
         $baseCost = 29.10;
@@ -193,5 +170,28 @@ class FetchOctopusUsage extends Command
         }
 
         return round($baseCost + $energyCost, 2);
+    }
+
+    private function outputMonthlySummary(Carbon $targetDate): void
+    {
+        $year = $targetDate->year;
+        $month = $targetDate->month;
+
+        if ($targetDate->day < 23) {
+            $start = Carbon::create($year, $month - 1, 23)->startOfDay();
+            $end = Carbon::create($year, $month, 22)->endOfDay();
+        } else {
+            $start = Carbon::create($year, $month, 23)->startOfDay();
+            $end = Carbon::create($year, $month + 1, 22)->endOfDay();
+        }
+
+        $usages = OctopusUsage::whereBetween('date', [$start->toDateString(), $end->toDateString()])->get();
+
+        $totalKWh = $usages->sum('kwh');
+        $totalCost = $usages->sum('estimated_cost');
+
+        $this->line("📊 月次集計（{$start->format('Y/m/d')}〜{$end->format('Y/m/d')}）");
+        $this->line("🔌 合計使用量: {$totalKWh} kWh");
+        $this->line("💰 合計金額: {$totalCost} 円");
     }
 }
