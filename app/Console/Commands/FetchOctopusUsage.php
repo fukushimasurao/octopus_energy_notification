@@ -9,33 +9,64 @@ use App\Models\OctopusUsage;
 
 class FetchOctopusUsage extends Command
 {
-    protected $signature = 'app:fetch-octopus-usage {--date=}';
+    protected $signature = 'app:fetch-octopus-usage {--date=} {--from=} {--to=}';
 
-    protected $description = 'Fetch daily electricity usage from Octopus and notify via LINE';
+    protected $description = 'Fetch daily electricity usage from Octopus and store in the database';
 
     public function handle(): int
     {
-        [$targetDateJST, $startUtc, $endUtc] = $this->getTargetDateRange();
-        $dateText = $targetDateJST->format('Y-m-d');
+        // 🔁 複数日対応
+        if ($this->option('from') && $this->option('to')) {
+            $from = Carbon::createFromFormat('Y-m-d', $this->option('from'));
+            $to = Carbon::createFromFormat('Y-m-d', $this->option('to'));
 
-        $this->info("\n🕒 UTC取得範囲: {$startUtc} ～ {$endUtc}");
-        $this->info("🗓 対象JST日付: {$dateText} (00:00 ～ 23:59)");
+            $token = $this->getToken();
+            if (!$token) {
+                $this->error("❌ トークン取得失敗（範囲指定）");
+                return 1;
+            }
 
+            while ($from->lte($to)) {
+                $date = $from->format('Y-m-d');
+                $this->info("📅 処理中: {$date}");
+                $this->processSingleDay($date, $token);
+                sleep(3); // API制限対策の待機
+                $from->addDay();
+            }
+
+            return 0;
+        }
+
+        // 🔁 単一日の処理
         $token = $this->getToken();
         if (!$token) {
             $this->error('❌ トークン取得失敗。');
             return 1;
         }
 
+        return $this->processSingleDay($this->option('date'), $token);
+    }
+
+    /**
+     * 指定日のデータを取得・保存
+     */
+    private function processSingleDay(?string $inputDate, string $token): int
+    {
+        [$targetDateJST, $startUtc, $endUtc] = $this->getTargetDateRange($inputDate);
+        $dateText = $targetDateJST->format('Y-m-d');
+
+        $this->info("\n🕒 UTC取得範囲: {$startUtc} ～ {$endUtc}");
+        $this->info("🗓 対象JST日付: {$dateText} (00:00 ～ 23:59)");
+
         $accountNumber = $this->getAccountNumber($token);
         if (!$accountNumber) {
-            $this->error('❌ アカウント番号取得失敗。');
+            $this->error("❌ アカウント番号取得失敗（{$dateText}）");
             return 1;
         }
 
         $readings = $this->getHalfHourlyReadings($token, $accountNumber, $startUtc, $endUtc);
         if (empty($readings)) {
-            $this->warn("⚠️ データが見つかりませんでした。");
+            $this->warn("⚠️ データが見つかりませんでした（{$dateText}）");
             return 0;
         }
 
@@ -61,13 +92,10 @@ class FetchOctopusUsage extends Command
     }
 
     /**
-     * 対象となるJST日付と、それに対応するUTCの開始・終了時刻を取得する。
-     *
-     * @return array [Carbon $targetDateJST, string $startUtc, string $endUtc]
+     * JST日付からUTCの範囲を取得
      */
-    private function getTargetDateRange(): array
+    private function getTargetDateRange(?string $inputDate = null): array
     {
-        $inputDate = $this->option('date');
         $targetDateJST = $inputDate
             ? Carbon::createFromFormat('Y-m-d', $inputDate)->startOfDay()
             : Carbon::yesterday()->startOfDay();
@@ -79,9 +107,7 @@ class FetchOctopusUsage extends Command
     }
 
     /**
-     * Octopus Energy APIからJWTトークンを取得する。
-     *
-     * @return string|null 成功時はトークン、失敗時はnull
+     * OctopusのJWTトークンを取得
      */
     private function getToken(): ?string
     {
@@ -101,10 +127,7 @@ class FetchOctopusUsage extends Command
     }
 
     /**
-     * トークンに紐づくOctopus Energyのアカウント番号を取得する。
-     *
-     * @param string $token JWTトークン
-     * @return string|null アカウント番号またはnull
+     * アカウント番号を取得
      */
     private function getAccountNumber(string $token): ?string
     {
@@ -118,13 +141,7 @@ class FetchOctopusUsage extends Command
     }
 
     /**
-     * 指定された期間の30分ごとの電力使用量データを取得する。
-     *
-     * @param string $token JWTトークン
-     * @param string $accountNumber アカウント番号
-     * @param string $startUtc UTCの開始日時
-     * @param string $endUtc UTCの終了日時
-     * @return array 使用量データの配列
+     * 指定期間の電力使用量データを取得
      */
     private function getHalfHourlyReadings(string $token, string $accountNumber, string $startUtc, string $endUtc): array
     {
@@ -152,10 +169,7 @@ class FetchOctopusUsage extends Command
     }
 
     /**
-     * 電力使用量（kWh）を30分ごとのデータから合計する。
-     *
-     * @param array $readings 使用量データ
-     * @return float 合計kWh
+     * 合計使用量（kWh）を算出
      */
     private function calculateTotalKWh(array $readings): float
     {
@@ -163,11 +177,7 @@ class FetchOctopusUsage extends Command
     }
 
     /**
-     * 指定されたkWh使用量に基づき、電気料金を推定する。
-     * 段階料金制に基づいて料金を計算し、基本料金を加算する。
-     *
-     * @param float $totalKWh 使用量（kWh）
-     * @return float 推定料金（円）
+     * 使用量から段階料金制で金額を算出
      */
     private function calculateEstimatedCost(float $totalKWh): float
     {
