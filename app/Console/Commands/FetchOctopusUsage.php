@@ -47,7 +47,7 @@ class FetchOctopusUsage extends Command
         $estimatedCost = $this->calculateEstimatedCost($totalKWh);
 
         $this->info("✅ {$dateText} の合計電力使用量: {$totalKWh} kWh");
-        $this->info("💰 推定電気料金: {$estimatedCost} 円 (税込)");
+        $this->info("💰 推定電気料金: {$estimatedCost} 円");
 
         return 0;
     }
