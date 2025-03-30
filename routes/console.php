@@ -8,4 +8,4 @@ Artisan::command('inspire', function () {
     $this->comment(Inspiring::quote());
 })->purpose('Display an inspiring quote');
 
-app(Schedule::class)->command('app:fetch-octopus-usage')->dailyAt('00:01');
+app(Schedule::class)->command('app:fetch-octopus-usage')->dailyAt('08:00');
